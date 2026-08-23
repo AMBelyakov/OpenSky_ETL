@@ -1,0 +1,274 @@
+name: artemw9
+
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow_dockerfile
+    dockerfile: Dockerfile
+  image: airflow:latest
+  user: "${AIRFLOW_UID:-50000}:0"
+  env_file:
+    - .env
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@artemw9-postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@artemw9-postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://artemw9-redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: 5
+    AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT: 180
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: 4
+  volumes:
+    - flight_data:/opt/synthetic_data
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./jars:/opt/spark/jars
+  depends_on: &airflow-deps
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_started
+    clickhouse:
+      condition: service_healthy
+    init-permissions:
+      condition: service_completed_successfully
+  networks:
+    - artemw9_net
+
+
+services:
+  init-permissions:
+    image: alpine:latest
+    container_name: artemw9-init-permissions
+    command: >
+      sh -c "chown -R ${AIRFLOW_UID:-50000}:0 /opt/synthetic_data
+      && chmod -R 775 /opt/synthetic_data
+      && echo 'Permissions fixed for flight_data'"
+    volumes:
+      - flight_data:/opt/synthetic_data
+    networks:
+      - artemw9_net
+    restart: "no"
+
+  postgres:
+    image: postgres:15
+    container_name: artemw9-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: airflow
+    ports:
+      - "5432:5432"
+    restart: always
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/init_db:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
+      interval: 5s
+      retries: 5
+    networks:
+      - artemw9_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: artemw9-redis
+    restart: always
+    networks:
+      - artemw9_net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: artemw9-clickhouse
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - artemw9_net
+
+
+# Разовая инициализация: миграции БД, админ и Connections. Остальные сервисы
+  # Airflow ждут её завершения.
+  airflow-init:
+    <<: *airflow-common
+    container_name: artemw9-af-init
+    restart: "no"
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    command:
+      - bash
+      - -c
+      - |
+          airflow db migrate
+
+          airflow users create \
+            --username "${_AIRFLOW_WWW_USER_USERNAME}" \
+            --password "${_AIRFLOW_WWW_USER_PASSWORD}" \
+            --firstname admin --lastname admin \
+            --role Admin --email admin@example.com || true
+
+          # Connections пересоздаём идемпотентно: --conn-id может уже существовать.
+          airflow connections delete 'spark_default' || true
+          airflow connections add 'spark_default' \
+            --conn-type 'spark' \
+            --conn-host 'local' \
+            --conn-extra '{"spark-binary": "spark-submit", "deploy-mode": "client"}'
+
+          airflow connections delete 'backend_db' || true
+          airflow connections add 'backend_db' \
+            --conn-type 'postgres' \
+            --conn-host 'artemw9-postgres' \
+            --conn-login "${POSTGRES_USER}" \
+            --conn-password "${POSTGRES_PASSWORD}" \
+            --conn-schema 'backend' \
+            --conn-port 5432
+
+          airflow connections delete 'minio_s3_conn' || true
+          airflow connections add 'minio_s3_conn' \
+            --conn-type 'aws' \
+            --conn-login "${MINIO_USER}" \
+            --conn-password "${MINIO_PASSWORD}" \
+            --conn-extra '{"endpoint_url": "http://artemw9-minio:9000"}'
+
+          airflow connections delete 'artemw9_tg' || true
+          airflow connections add 'artemw9_tg' \
+            --conn-type 'telegram' \
+            --conn-password "${TELEGRAM_BOT_TOKEN}"
+
+          airflow variables set Artemw9_TELEGRAM_CHAT_ID "${TELEGRAM_CHAT_ID}"
+
+          # Зона наблюдения. Подобрана замером плотности бортов, а не картой:
+          # покрытие OpenSky держится на волонтёрских приёмниках и распределено
+          # неравномерно. Замер 2026-08-09 — Москва (24 кв.°): 8 бортов, её же
+          # расширение до 60 кв.°: те же 8; эта зона (21 кв.°): ~258 бортов.
+          # Площадь <= 25 кв.° держит тариф в 1 кредит за запрос.
+          airflow variables set OPENSKY_BBOX '{"lamin": 50.0, "lomin": 4.0, "lamax": 53.0, "lomax": 11.0}'
+
+          # Окно подобрано под время пересечения зоны: борт на крейсере проходит
+          # её примерно за полчаса, так что 1800 с ловят трек целиком, а не
+          # фрагмент. 1800/20 = 90 запросов, то есть 90 кредитов из 400 в сутки.
+          airflow variables set OPENSKY_WINDOW_SEC "1800"
+          airflow variables set OPENSKY_INTERVAL_SEC "20"
+
+          echo "Airflow init завершён."
+
+
+  af-webserver:
+    <<: *airflow-common
+    container_name: artemw9-af-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    restart: always
+    depends_on:
+      <<: *airflow-deps
+      airflow-init:
+        condition: service_completed_successfully
+
+  af-scheduler:
+    <<: *airflow-common
+    container_name: artemw9-af-scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      <<: *airflow-deps
+      airflow-init:
+        condition: service_completed_successfully
+
+  af-worker:
+    <<: *airflow-common
+    container_name: artemw9-af-worker
+    hostname: af-worker
+    command: celery worker
+    restart: always
+    depends_on:
+      <<: *airflow-deps
+      airflow-init:
+        condition: service_completed_successfully
+
+  
+  minio:
+    image: minio/minio:latest
+    container_name: artemw9-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    ports:
+      - "9005:9000"
+      - "9006:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - artemw9_net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: artemw9-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio http://artemw9-minio:9000 ${MINIO_USER} ${MINIO_PASSWORD};
+      /usr/bin/mc mb myminio/etl-bucket --ignore-existing;
+      echo 'Bucket etl-bucket ready';
+      exit 0;
+      "
+    networks:
+      - artemw9_net
+
+  metabase:
+    image: metabase/metabase:latest
+    container_name: artemw9-metabase
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: metabase
+      MB_DB_HOST: artemw9-postgres
+      MB_DB_PORT: 5432
+      MB_DB_USER: ${POSTGRES_USER}
+      MB_DB_PASS: ${POSTGRES_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - artemw9_net
+
+
+volumes:
+  flight_data:
+  postgres_data:
+  clickhouse_data:
+  minio_data:
+
+
+networks:
+  artemw9_net:
+    driver: bridge
