@@ -1,0 +1,26 @@
+# Секреты. Шаблон лежит в .env.example.
+.env
+
+# Python
+**/__pycache__/
+*.py[cod]
+
+# Данные и тома контейнеров
+logs/
+jars/
+synthetic_data/
+metabase_data/
+
+# Данные ClickHouse лежат в именованном томе, отсюда монтируется только
+# init-скрипт. Правило страхует на случай возврата bind-mount: исключать
+# нужно clickhouse/*, а не clickhouse/ — иначе строка ниже не сработает.
+clickhouse/*
+!clickhouse/init
+
+docker_related_config.xml
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
