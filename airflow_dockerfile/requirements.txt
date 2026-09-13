@@ -1,0 +1,15 @@
+# Провайдеры Airflow
+apache-airflow-providers-apache-spark
+apache-airflow-providers-amazon
+apache-airflow-providers-telegram
+
+# Spark: spark-submit приезжает вместе с pyspark
+pyspark
+
+# Extract / convert
+requests
+pandas
+pyarrow
+
+# JDBC-запись в Postgres из трансформации
+psycopg2-binary
